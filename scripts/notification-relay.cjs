@@ -675,6 +675,46 @@ function matchesSensitivity(ruleSensitivity, eventSeverity) {
  * back to the legacy result so real notifications are unaffected. Logs to
  * shadow:score-log (currently v3) for tuning.
  */
+/**
+ * Filter events by per-rule country-scope.
+ *
+ * When `rule.countries` is empty / absent, all events match (current behavior,
+ * full backwards-compat for pre-migration rules).
+ *
+ * When `rule.countries` is populated, the user explicitly opted into country-
+ * scoped alerts. We try multiple payload shapes for the event's country
+ * attribution because publishers are inconsistent: regional-snapshot uses
+ * `payload.countryCode`, ais-relay sometimes uses `payload.country`, browser-
+ * submitted rss_alert events occasionally lift `country` to the event root.
+ *
+ * STRICT semantics: events with NO country attribution are NOT delivered to
+ * a country-scoped rule. The alternative — "deliver unscoped events too" —
+ * would surprise a user who set countries=['US'] expecting to see only US
+ * alerts. The strict path errs on under-delivery, which is recoverable
+ * (user empties the list / removes scope), vs over-delivery which trains
+ * users to ignore notifications.
+ *
+ * Country values are normalized to uppercase ISO-3166 alpha-2 before
+ * matching. Malformed values (non-2-letter, multi-word names) fail the
+ * regex and the event is dropped for the country-scoped rule.
+ */
+function eventMatchesCountryScope(event, rule) {
+  if (!Array.isArray(rule.countries) || rule.countries.length === 0) return true;
+
+  const eventCountry =
+    event?.payload?.countryCode
+    ?? event?.payload?.country
+    ?? event?.country
+    ?? null;
+
+  if (typeof eventCountry !== 'string') return false;
+
+  const normalized = eventCountry.trim().toUpperCase();
+  if (!/^[A-Z]{2}$/.test(normalized)) return false;
+
+  return rule.countries.includes(normalized);
+}
+
 function shouldNotify(rule, event) {
   // Coerce (effective realtime + non-critical) → 'critical' before consulting
   // sensitivity in either branch. The mutation validators + migration make this
@@ -952,6 +992,7 @@ async function processEvent(event) {
     (!r.digestMode || r.digestMode === 'realtime') &&
     (r.eventTypes.length === 0 || r.eventTypes.includes(event.eventType)) &&
     shouldNotify(r, event) &&
+    eventMatchesCountryScope(event, r) &&
     (!event.variant || !r.variant || r.variant === event.variant) &&
     (!event.userId || r.userId === event.userId)
   );

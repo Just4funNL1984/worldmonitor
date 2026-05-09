@@ -21,6 +21,7 @@ import {
 import { getCurrentClerkUser } from '@/services/clerk';
 import { hasTier } from '@/services/entitlements';
 import { SITE_VARIANT } from '@/config/variant';
+import { mountCountryChipPicker, loadFollowedCountriesSafe, type CountryChipPickerHandle } from '@/utils/country-chip-picker';
 
 const QUIET_HOURS_BATCH_ENABLED = import.meta.env.VITE_QUIET_HOURS_BATCH_ENABLED !== '0';
 const DIGEST_CRON_ENABLED = import.meta.env.VITE_DIGEST_CRON_ENABLED !== '0';
@@ -374,10 +375,27 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
               </label>
             </div>
           </div>
+          <div class="ai-flow-section-label" style="margin-top:8px">Country scope</div>
+          <div class="ai-flow-toggle-desc" style="margin-bottom:6px">Restrict alerts to specific countries (ISO-3166 alpha-2). Leave empty to receive alerts from all countries.</div>
+          <div id="usNotifCountryPicker"></div>
           <div class="ai-flow-section-label" style="margin-top:8px">Timezone</div>
           <select class="unified-settings-select" id="usSharedTimezone" style="width:100%">${makeTzOptions(sharedTz)}</select>`;
         return html;
       }
+
+      // Country chip picker handle — recreated each reload. Held outside the
+      // reload closure so the change handlers (debounced save below) can read
+      // the current value via picker?.getValue().
+      let countryPicker: CountryChipPickerHandle | null = null;
+
+      // Debounce timers — declared up-front so the country picker's onChange
+      // (defined inside an async then() that fires after this scope's sync
+      // body completes) can reuse alertRuleDebounceTimer without TDZ risk.
+      let slackOAuthPopup: Window | null = null;
+      let discordOAuthPopup: Window | null = null;
+      let alertRuleDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+      let qhDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+      let digestDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
       function reloadNotifSection(): void {
         const loadingEl = container.querySelector<HTMLElement>('#usNotifLoading');
@@ -386,15 +404,74 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
         loadingEl.style.display = 'block';
         contentEl.style.display = 'none';
         if (signal.aborted) return;
-        getChannelsData().then((data) => {
+        getChannelsData().then(async (data) => {
           if (signal.aborted) return;
           contentEl.innerHTML = renderNotifContent(data);
           loadingEl.style.display = 'none';
           contentEl.style.display = 'block';
+
+          // Tear down stale picker (if any) before mounting fresh one — the
+          // innerHTML rewrite above orphans the previous root.
+          if (countryPicker) {
+            try { countryPicker.destroy(); } catch { /* ignore */ }
+            countryPicker = null;
+          }
+
+          const pickerRoot = contentEl.querySelector<HTMLElement>('#usNotifCountryPicker');
+          if (!pickerRoot) return;
+
+          const existingRule = data.alertRules?.[0] ?? null;
+          const existingCountries = Array.isArray(existingRule?.countries) ? existingRule!.countries! : [];
+          // Smart-default ONLY on NEW-rule create — when there's no existing
+          // alertRules row at all. If the user already has a row (even with
+          // countries: []), respect that as an explicit "all countries" choice.
+          const isNewRule = existingRule === null;
+
+          let initial = existingCountries;
+          if (isNewRule) {
+            const followed = await loadFollowedCountriesSafe();
+            if (followed.length > 0) initial = followed;
+          }
+
+          countryPicker = mountCountryChipPicker(pickerRoot, {
+            initial,
+            onChange: () => {
+              // Debounced save through the existing alertRule pipeline.
+              if (alertRuleDebounceTimer) clearTimeout(alertRuleDebounceTimer);
+              alertRuleDebounceTimer = setTimeout(() => {
+                saveCurrentAlertRule();
+              }, 800);
+            },
+          });
         }).catch((err) => {
           if (signal.aborted) return;
           console.error('[notifications] Failed to load settings:', err);
           if (loadingEl) loadingEl.textContent = 'Failed to load notification settings.';
+        });
+      }
+
+      // Read all current alert-rule fields off the DOM and POST through the
+      // existing saveAlertRules pipeline (forwards `countries` per the
+      // notification-channels API contract).
+      function saveCurrentAlertRule(): void {
+        const enabledEl = container.querySelector<HTMLInputElement>('#usNotifEnabled');
+        const sensitivityEl = container.querySelector<HTMLSelectElement>('#usNotifSensitivity');
+        const aiDigestEl = container.querySelector<HTMLInputElement>('#usAiDigestEnabled');
+        const enabled = enabledEl?.checked ?? false;
+        const sensitivity = (sensitivityEl?.value ?? 'all') as 'all' | 'high' | 'critical';
+        const connectedChannelTypes = Array.from(
+          container.querySelectorAll<HTMLElement>('[data-channel-type]'),
+        )
+          .filter(el => el.classList.contains('us-notif-ch-on'))
+          .map(el => el.dataset.channelType as ChannelType);
+        void saveAlertRules({
+          variant: SITE_VARIANT,
+          enabled,
+          eventTypes: [],
+          sensitivity,
+          channels: connectedChannelTypes,
+          aiDigestEnabled: aiDigestEl?.checked ?? true,
+          countries: countryPicker ? countryPicker.getValue() : undefined,
         });
       }
 
@@ -414,11 +491,6 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
         void saveAlertRules({ variant: SITE_VARIANT, enabled, eventTypes: [], sensitivity, channels, aiDigestEnabled: aiEl?.checked ?? true });
       }
 
-      let slackOAuthPopup: Window | null = null;
-      let discordOAuthPopup: Window | null = null;
-      let alertRuleDebounceTimer: ReturnType<typeof setTimeout> | null = null;
-      let qhDebounceTimer: ReturnType<typeof setTimeout> | null = null;
-      let digestDebounceTimer: ReturnType<typeof setTimeout> | null = null;
       signal.addEventListener('abort', () => {
         if (alertRuleDebounceTimer !== null) {
           clearTimeout(alertRuleDebounceTimer);
