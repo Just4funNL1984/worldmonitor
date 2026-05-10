@@ -215,6 +215,18 @@ export function buildUpstreamEvent(p: {
 
 // ---------- Header-derived helpers (ok to take Request — these only read primitives) ----------
 
+// Cap free-form header values before they hit Axiom. A misbehaving or hostile
+// caller can send headers up to the runtime's per-header ceiling (8–32 KB);
+// without a bound, those records inflate storage and query cost long after
+// the request is gone. 512 chars covers ~99% of real UA / Referer / Accept-
+// Language / Host values without truncating anything observed in practice.
+const MAX_HEADER_FIELD_LEN = 512;
+
+function capHeaderValue(s: string | null): string | null {
+  if (s == null) return null;
+  return s.length > MAX_HEADER_FIELD_LEN ? s.slice(0, MAX_HEADER_FIELD_LEN) : s;
+}
+
 export function deriveRequestId(req: Request): string {
   return req.headers.get('x-vercel-id') ?? '';
 }
@@ -250,8 +262,11 @@ export function deriveIpRegion(req: Request): string | null {
 }
 
 // Client IP. Order matches Vercel's documented precedence; cf-connecting-ip is
-// only present when the request transited Cloudflare, x-forwarded-for is the
-// last-resort hop list (first entry is the originating client).
+// only present when the request transited Cloudflare. x-forwarded-for is the
+// last-resort hop list — we take the *rightmost* entry, since Vercel/proxies
+// append the real socket IP on the right while clients can inject arbitrary
+// values on the left. On Vercel this branch should be unreachable; the safer
+// choice matters in local dev or non-Vercel deploys.
 export function deriveIp(req: Request): string | null {
   const real = req.headers.get('x-real-ip');
   if (real) return real;
@@ -259,26 +274,39 @@ export function deriveIp(req: Request): string | null {
   if (cf) return cf;
   const xff = req.headers.get('x-forwarded-for');
   if (xff) {
-    const first = xff.split(',')[0]?.trim();
-    if (first) return first;
+    const parts = xff.split(',');
+    const last = parts[parts.length - 1]?.trim();
+    if (last) return last;
   }
   return null;
 }
 
 export function deriveUserAgent(req: Request): string | null {
-  return req.headers.get('user-agent') ?? null;
+  return capHeaderValue(req.headers.get('user-agent'));
 }
 
+// Strip query and fragment before storing. Browsers send the full referring
+// URL, and password-reset / email-confirm / OAuth-callback links carry
+// short-lived credentials in their query string — the same reason the current
+// request's query string is deliberately not logged. Origin + pathname is
+// enough for traffic-source attribution.
 export function deriveReferer(req: Request): string | null {
-  return req.headers.get('referer') ?? null;
+  const raw = req.headers.get('referer');
+  if (!raw) return null;
+  try {
+    const u = new URL(raw);
+    return capHeaderValue(`${u.origin}${u.pathname}`);
+  } catch {
+    return null;
+  }
 }
 
 export function deriveAcceptLanguage(req: Request): string | null {
-  return req.headers.get('accept-language') ?? null;
+  return capHeaderValue(req.headers.get('accept-language'));
 }
 
 export function deriveHost(req: Request): string | null {
-  return req.headers.get('host') ?? null;
+  return capHeaderValue(req.headers.get('host'));
 }
 
 export function deriveReqBytes(req: Request): number {
